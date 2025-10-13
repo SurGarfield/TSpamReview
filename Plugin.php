@@ -1,13 +1,12 @@
 ﻿<?php
 /**
- * 智能评论审核插件 - 敏感词检测、中文检测、百度内容审核、管理员豁免
+ * 智能评论审核插件 - 敏感词检测、中文检测、百度内容审核、管理员豁免、一键拉黑
  *
  * @package TSpamReview
  * @author 森木志
- * @version 1.0.6
+ * @version 1.2.2
  * @link https://oxxx.cn
  * @license MIT
-
  */
 
 if (!defined('__TYPECHO_ROOT_DIR__')) {
@@ -52,10 +51,12 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		// 注册钩子
 		Typecho_Plugin::factory('Widget_Feedback')->comment = [__CLASS__, 'onBeforeComment'];
 		Typecho_Plugin::factory('Widget_Feedback')->finishComment = [__CLASS__, 'onFinishComment'];
-		Typecho_Plugin::factory('Widget_Archive')->header = [__CLASS__, 'header'];
+		// 仅在页脚注入脚本，避免在 <body> 顶部插入节点破坏 margin collapsing
 		Typecho_Plugin::factory('Widget_Archive')->footer = [__CLASS__, 'footer'];
+		Typecho_Plugin::factory('admin/footer.php')->end = [__CLASS__, 'adminFooter'];
 
 		Helper::addAction('TSpamReview', 'TSpamReview_Action');
+		Helper::addAction('TSpamReviewBlacklist', 'TSpamReview_BlacklistAction');
 
 		return _t('TSpamReview 插件已成功激活！');
 	}
@@ -64,6 +65,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 	{
 		if (class_exists('Helper')) {
 			Helper::removeAction('TSpamReview');
+			Helper::removeAction('TSpamReviewBlacklist');
 		}
 		return _t('TSpamReview 插件已禁用。');
 	}
@@ -84,6 +86,39 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		);
 		$sensitiveWords->setAttribute('rows', 8);
 		$form->addInput($sensitiveWords);
+
+		$ipBlacklist = new Typecho_Widget_Helper_Form_Element_Textarea(
+			'ipBlacklist',
+			null,
+			'',
+			_t('IP地址黑名单'),
+			_t('每行一个IP地址；黑名单中的IP将无法发表评论。可在评论管理页面使用"拉黑"功能快速添加。')
+		);
+		$ipBlacklist->setAttribute('rows', 6);
+		$form->addInput($ipBlacklist);
+
+		$emailBlacklist = new Typecho_Widget_Helper_Form_Element_Textarea(
+			'emailBlacklist',
+			null,
+			'',
+			_t('邮箱黑名单'),
+			_t('每行一个邮箱地址；黑名单中的邮箱将无法发表评论。可在评论管理页面使用"拉黑"功能快速添加。')
+		);
+		$emailBlacklist->setAttribute('rows', 6);
+		$form->addInput($emailBlacklist);
+
+		// 拉黑后的操作
+		$blacklistAction = new Typecho_Widget_Helper_Form_Element_Radio(
+			'blacklistDeleteComment',
+			[
+				'0' => _t('保留评论（仅添加到黑名单）'),
+				'1' => _t('删除评论（拉黑的同时删除该评论）')
+			],
+			'0',
+			_t('拉黑后是否删除评论'),
+			_t('选择拉黑操作后是否同时删除该条评论。注意：删除操作不可恢复！')
+		);
+		$form->addInput($blacklistAction);
 
 		$actionOptions = [
 			'A' => _t('A: 无操作（允许）'),
@@ -212,12 +247,165 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 
 	public static function header()
 	{
-		self::emitFrontScript();
+		// 不再在 header 中输出任何内容，避免影响首屏布局与 margin 折叠
+		return; 
 	}
 
 	public static function footer()
 	{
 		self::emitFrontScript();
+	}
+
+	/**
+	 * 后台页脚钩子 - 在评论管理页面注入拉黑功能
+	 */
+	public static function adminFooter()
+	{
+		// 只在评论管理页面加载
+		$request = Typecho_Request::getInstance();
+		if (strpos($request->getRequestUri(), 'manage-comments.php') === false) {
+			return;
+		}
+
+		// 获取安全URL
+		$securityUrl = Helper::security()->getIndex('/action/TSpamReviewBlacklist');
+
+		// 获取插件配置URL（仅管理员可见）
+		$pluginConfigUrl = '';
+		try {
+			$user = Typecho_Widget::widget('Widget_User');
+			if ($user->pass('administrator', true)) {
+				$pluginConfigUrl = Typecho_Widget::widget('Widget_Options')->adminUrl('options-plugin.php?config=TSpamReview', true);
+			}
+		} catch (Exception $e) {
+			// 忽略错误
+		}
+
+		// 输出拉黑功能的样式和脚本
+		?>
+		<!-- TSpamReview 一键拉黑功能 -->
+		<style>
+			.tspam-blacklist-row {
+				display: inline;
+				position: relative;
+				margin-left: 8px;
+			}
+			
+			.tspam-blacklist-btn {
+				color: #c33 !important;
+				cursor: pointer !important;
+				transition: color 0.2s;
+				display: inline-block;
+				user-select: none;
+			}
+			
+			.tspam-blacklist-btn:hover {
+				color: #d11 !important;
+				text-decoration: underline;
+			}
+			
+			.tspam-blacklist-btn:active {
+				color: #a00 !important;
+			}
+			
+			/* 移动端适配 */
+			@media (max-width: 575px) {
+				.tspam-blacklist-row {
+					display: block;
+					margin-left: 0;
+					margin-top: 4px;
+				}
+			}
+		</style>
+
+		<script type="text/javascript">
+		(function($) {
+			'use strict';
+			
+			// 配置
+			var securityUrl = '<?php echo $securityUrl; ?>';
+			var pluginConfigUrl = '<?php echo $pluginConfigUrl; ?>';
+			
+			// 如果有配置URL，添加配置按钮
+			if (pluginConfigUrl) {
+				$('.typecho-list-operate .operate').append(
+					'<button class="btn btn-s" onclick="window.location.href=\'' + pluginConfigUrl + '\'" type="button">拉黑管理</button>'
+				);
+			}
+			
+			// 为每个评论行添加拉黑按钮
+			$('.typecho-list-table tbody tr').each(function() {
+				var $row = $(this);
+				var commentData = $row.data('comment');
+				
+				if (!commentData) {
+					return;
+				}
+				
+				// 获取评论ID
+				var coid = $row.find('input[type=checkbox]').first().val();
+				var ip = commentData.ip || '';
+				var email = commentData.mail || '';
+				var author = commentData.author || '匿名';
+				
+				// 如果既没有IP也没有邮箱，不显示拉黑按钮
+				if (!ip && !email) {
+					return;
+				}
+				
+				// 构建拉黑按钮HTML（使用span避免链接被修改）
+				var html = '<div class="tspam-blacklist-row">';
+				html += '<span class="tspam-blacklist-btn" ';
+				html += 'data-coid="' + coid + '" ';
+				html += 'data-ip="' + (ip || '') + '" ';
+				html += 'data-email="' + (email || '') + '" ';
+				html += 'data-author="' + author + '" ';
+				html += 'style="color:#c33;cursor:pointer;user-select:none;"';
+				html += '>拉黑</span>';
+				html += '</div>';
+				
+				// 插入到操作区域
+				$row.find('.comment-action').append(html);
+			});
+			
+			// 绑定拉黑按钮点击事件
+			$(document).on('click', '.tspam-blacklist-btn', function(e) {
+				e.preventDefault();
+				e.stopPropagation();
+				
+				var $btn = $(this);
+				var coid = $btn.data('coid');
+				var ip = $btn.data('ip');
+				var email = $btn.data('email');
+				var author = $btn.data('author');
+				
+				// 构建确认消息
+				var message = '确认拉黑该评论？\n\n';
+				message += '评论者：' + author + '\n';
+				if (ip) message += 'IP地址：' + ip + '\n';
+				if (email) message += '邮箱：' + email + '\n';
+				message += '\n拉黑后，该IP和邮箱将无法再发表评论。';
+				
+				if (!confirm(message)) {
+					return false;
+				}
+				
+				// 构建URL参数
+				var params = [];
+				if (ip) params.push('ip=' + encodeURIComponent(ip));
+				if (email) params.push('email=' + encodeURIComponent(email));
+				params.push('coid=' + coid);
+				
+				// 直接跳转到处理页面
+				var targetUrl = securityUrl + '&' + params.join('&');
+				window.location.href = targetUrl;
+				
+				return false;
+			});
+			
+		})(jQuery);
+		</script>
+		<?php
 	}
 
 	private static function emitFrontScript()
@@ -230,17 +418,21 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			}
 			$rawList = isset($opts->sensitiveWords) ? (string)$opts->sensitiveWords : '';
 			$words = array_values(self::parseSensitiveList($rawList));
-			$wordsJs = json_encode($words, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 			$contentAction = isset($opts->contentChineseAction) ? (string)$opts->contentChineseAction : 'A';
 			$authorAction = isset($opts->authorChineseAction) ? (string)$opts->authorChineseAction : 'A';
 
-			// Delegate to FrontScript emitter (heredoc) to avoid inline JS escaping issues
-			if (!class_exists('TSpamReview_FrontScript')) {
-				@include_once __DIR__ . '/FrontScript.php';
-			}
-			if (class_exists('TSpamReview_FrontScript')) {
-				TSpamReview_FrontScript::emit($wordsJs, $contentAction, $authorAction);
-			}
+			// 直接输出配置与静态脚本，避免包含文件可能引入的 BOM 输出
+			$site = Helper::options()->siteUrl;
+			$asset = rtrim($site, '/') . '/usr/plugins/TSpamReview/static/front.js.php';
+			$preAuditUrl = rtrim($site, '/') . '/usr/plugins/TSpamReview/endpoint.php';
+			$config = json_encode([
+				'words' => $words,
+				'contentAction' => $contentAction,
+				'authorAction' => $authorAction,
+				'preAuditUrl' => $preAuditUrl,
+			], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+			echo '<script>window.TSpamReviewConfig=' . $config . '</script>';
+			echo '<script src="' . htmlspecialchars($asset, ENT_QUOTES, 'UTF-8') . '"></script>';
 		} catch (Exception $e) {
 			// ignore
 		}
@@ -260,7 +452,27 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		}
 		self::debug('[continue] not admin or bypass disabled, continue checking');
 
-			// 1) 敏感词检测（内容/昵称/邮箱）
+			// 1) IP黑名单检测
+			$ipBlacklist = self::parseBlacklist(isset($opts->ipBlacklist) ? $opts->ipBlacklist : '');
+			if (!empty($ipBlacklist)) {
+				$commentIp = isset($comment['ip']) ? (string)$comment['ip'] : '';
+				if ($commentIp !== '' && in_array($commentIp, $ipBlacklist, true)) {
+					self::debug('[deny] IP in blacklist: ' . $commentIp);
+					throw new Typecho_Widget_Exception(_t('评论失败'));
+				}
+			}
+
+			// 2) 邮箱黑名单检测
+			$emailBlacklist = self::parseBlacklist(isset($opts->emailBlacklist) ? $opts->emailBlacklist : '');
+			if (!empty($emailBlacklist)) {
+				$commentEmail = isset($comment['mail']) ? (string)$comment['mail'] : '';
+				if ($commentEmail !== '' && in_array($commentEmail, $emailBlacklist, true)) {
+					self::debug('[deny] Email in blacklist: ' . $commentEmail);
+					throw new Typecho_Widget_Exception(_t('评论失败'));
+				}
+			}
+
+			// 3) 敏感词检测（内容/昵称/邮箱）
 			$sensitiveList = self::parseSensitiveList(isset($opts->sensitiveWords) ? $opts->sensitiveWords : '');
 			if (!empty($sensitiveList)) {
 				if (self::hasSensitiveWord([
@@ -273,7 +485,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				}
 			}
 
-			// 2) 中文检测：评论内容
+			// 4) 中文检测：评论内容
 			$contentAction = isset($opts->contentChineseAction) ? (string)$opts->contentChineseAction : 'A';
 			if (!self::stringHasChinese(isset($comment['text']) ? (string)$comment['text'] : '')) {
 				if ($contentAction === 'C') {
@@ -285,7 +497,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				}
 			}
 
-			// 3) 中文检测：昵称
+			// 5) 中文检测：昵称
 			$authorAction = isset($opts->authorChineseAction) ? (string)$opts->authorChineseAction : 'A';
 			if (!self::stringHasChinese(isset($comment['author']) ? (string)$comment['author'] : '')) {
 				if ($authorAction === 'C') {
@@ -297,7 +509,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				}
 			}
 
-			// 4) 可选：百度文本审核
+			// 6) 可选：百度文本审核
 			$baiduEnabled = isset($opts->baiduEnable) && is_array($opts->baiduEnable) && in_array('enable', $opts->baiduEnable, true);
 			if ($baiduEnabled) {
 				$apiKey = isset($opts->baiduApiKey) ? trim((string)$opts->baiduApiKey) : '';
@@ -360,6 +572,26 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		}
 		$list = array_keys($clean);
 		self::debug('[sens] parsed words count=' . count($list));
+		return $list;
+	}
+
+	/**
+	 * 解析黑名单列表（IP或邮箱）
+	 * @param string $raw 原始文本
+	 * @return array 去重后的黑名单数组
+	 */
+	private static function parseBlacklist($raw)
+	{
+		$items = preg_split('/\r?\n/', (string)$raw);
+		$clean = [];
+		foreach ($items as $item) {
+			$value = trim($item);
+			if ($value !== '') {
+				$clean[$value] = true;
+			}
+		}
+		$list = array_keys($clean);
+		self::debug('[blacklist] parsed items count=' . count($list));
 		return $list;
 	}
 
@@ -740,5 +972,23 @@ class TSpamReview_Action extends Typecho_Widget implements Widget_Interface_Do
 			'message' => 'This endpoint is deprecated. Please use endpoint.php instead.'
 		]);
 	}
+}
+
+/**
+ * 加载 BlacklistAction 类
+ */
+if (!class_exists('TSpamReview_BlacklistAction')) {
+    try {
+        // 仅在后台或直接访问 Action 时加载，避免前台无谓包含引入潜在输出
+        $isAdmin = defined('__TYPECHO_ADMIN__');
+        $reqUri = '';
+        try {
+            $req = Typecho_Request::getInstance();
+            $reqUri = $req ? (string)$req->getRequestUri() : '';
+        } catch (Exception $e) {}
+        if ($isAdmin || strpos($reqUri, 'action/TSpamReviewBlacklist') !== false) {
+            require_once __DIR__ . '/BlacklistAction.php';
+        }
+    } catch (Exception $e) {}
 }
 
