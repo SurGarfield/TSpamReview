@@ -26,3 +26,6 @@ typecho评论审核插件，支持敏感词过滤、中文检测、百度文本�
 上传到typecho的plugins文件夹，重命名为TSpamReview，启用后按照自己要求设置就行
 
 如果要使用百度本文审核的话需要在百度Ai控制台的 [产品服务 / 内容审核 - 应用列表](https://console.bce.baidu.com/ai/?fromai=1#/ai/antiporn/app/list) 创建应用 后获取 API Key、Secret Key填入插件对应位置。
+
+
+已更新：一键拉黑功能
