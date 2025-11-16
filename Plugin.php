@@ -1,10 +1,10 @@
-﻿<?php
+<?php
 /**
- * 智能评论审核插件 - 敏感词检测、中文检测、百度内容审核、管理员豁免、一键拉黑
+ * 智能评论审核插件 - 敏感词检测、广告拦截、外语拦截、中文检测、百度内容审核、管理员豁免、一键拉黑、拦截日志
  *
  * @package TSpamReview
  * @author 森木志
- * @version 1.2.2
+ * @version 1.3.1
  * @link https://oxxx.cn
  * @license MIT
  */
@@ -17,7 +17,13 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 {
 	/** @var string */
 	private static $tokenCacheFile = __DIR__ . DIRECTORY_SEPARATOR . '.baidu_token.json';
-
+	
+	/** @var string */
+	private static $logDir = __DIR__ . DIRECTORY_SEPARATOR . 'logs';
+	
+	/** @var string */
+	private static $logFile = null;
+	
 	public static function activate()
 	{
 		// 检查 PHP 版本
@@ -48,15 +54,44 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			}
 		}
 
-		// 注册钩子
-		Typecho_Plugin::factory('Widget_Feedback')->comment = [__CLASS__, 'onBeforeComment'];
-		Typecho_Plugin::factory('Widget_Feedback')->finishComment = [__CLASS__, 'onFinishComment'];
-		// 仅在页脚注入脚本，避免在 <body> 顶部插入节点破坏 margin collapsing
-		Typecho_Plugin::factory('Widget_Archive')->footer = [__CLASS__, 'footer'];
-		Typecho_Plugin::factory('admin/footer.php')->end = [__CLASS__, 'adminFooter'];
+		// 创建日志目录
+		$logDir = __DIR__ . DIRECTORY_SEPARATOR . 'logs';
+		if (!is_dir($logDir)) {
+			if (!@mkdir($logDir, 0755, true)) {
+				throw new Typecho_Plugin_Exception(_t('无法创建日志目录，请检查权限'));
+			}
+		}
+		
+		// 创建 .gitignore 文件
+		$gitignorePath = $logDir . DIRECTORY_SEPARATOR . '.gitignore';
+		if (!file_exists($gitignorePath)) {
+			@file_put_contents($gitignorePath, "*.log\n*.txt\n");
+		}
+
+		// 写入测试日志，验证日志功能正常
+		$testLogFile = $logDir . DIRECTORY_SEPARATOR . 'blocked_' . date('Y-m-d') . '.log';
+		$testLog = json_encode([
+			'time' => date('Y-m-d H:i:s'),
+			'author' => '测试日志',
+			'mail' => 'test@example.com',
+			'ip' => '127.0.0.1',
+			'text' => '插件激活测试 - 如果看到此日志说明日志功能正常',
+			'reason' => '插件激活测试'
+		], JSON_UNESCAPED_UNICODE) . "\n";
+		@file_put_contents($testLogFile, $testLog, FILE_APPEND | LOCK_EX);
+
+	// 注册钩子
+	Typecho_Plugin::factory('Widget_Feedback')->comment = [__CLASS__, 'onBeforeComment'];
+	Typecho_Plugin::factory('Widget_Feedback')->finishComment = [__CLASS__, 'onFinishComment'];
+	// 仅在页脚注入脚本，避免在 <body> 顶部插入节点破坏 margin collapsing
+	Typecho_Plugin::factory('Widget_Archive')->footer = [__CLASS__, 'footer'];
+	Typecho_Plugin::factory('admin/footer.php')->end = [__CLASS__, 'adminFooter'];
 
 		Helper::addAction('TSpamReview', 'TSpamReview_Action');
 		Helper::addAction('TSpamReviewBlacklist', 'TSpamReview_BlacklistAction');
+
+		// 注册扩展页面（日志查看）
+		Helper::addPanel(1, 'TSpamReview/logs.php', _t('TSpamReview 日志'), _t('查看评论拦截日志'), 'administrator');
 
 		return _t('TSpamReview 插件已成功激活！');
 	}
@@ -66,6 +101,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		if (class_exists('Helper')) {
 			Helper::removeAction('TSpamReview');
 			Helper::removeAction('TSpamReviewBlacklist');
+			Helper::removePanel(1, 'TSpamReview/logs.php');
 		}
 		return _t('TSpamReview 插件已禁用。');
 	}
@@ -86,6 +122,47 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		);
 		$sensitiveWords->setAttribute('rows', 8);
 		$form->addInput($sensitiveWords);
+
+		// ==================== 广告/垃圾内容拦截 ====================
+		$spamInfo = new Typecho_Widget_Helper_Layout('div', ['class' => 'typecho-option']);
+		$spamInfo->html('<h3>广告/垃圾内容拦截</h3><p style="color:#999;">拦截包含电话、微信、URL、重复内容等广告信息</p>');
+		$form->addItem($spamInfo);
+
+		$blockSpam = new Typecho_Widget_Helper_Form_Element_Checkbox(
+			'blockSpam',
+			['enable' => _t('启用广告内容拦截')],
+			['enable'],
+			_t('广告内容拦截'),
+			_t('自动检测并拦截包含电话号码、微信号、URL链接、大量重复内容等广告信息')
+		);
+		$form->addInput($blockSpam->multiMode());
+
+		$authorMaxLength = new Typecho_Widget_Helper_Form_Element_Text(
+			'authorMaxLength',
+			null,
+			'30',
+			_t('昵称最大长度'),
+			_t('限制评论昵称的最大字符长度，超过则拒绝（0表示不限制）')
+		);
+		$form->addInput($authorMaxLength);
+
+		$blockGarbledAuthor = new Typecho_Widget_Helper_Form_Element_Checkbox(
+			'blockGarbledAuthor',
+			['enable' => _t('拦截乱码内容')],
+			['enable'],
+			_t('乱码拦截'),
+			_t('检测昵称、邮箱、网址、评论内容中是否包含大量特殊符号、emoji或不可读字符')
+		);
+		$form->addInput($blockGarbledAuthor->multiMode());
+
+		$strictEmailCheck = new Typecho_Widget_Helper_Form_Element_Checkbox(
+			'strictEmailCheck',
+			['enable' => _t('启用严格邮箱格式检查')],
+			['enable'],
+			_t('邮箱格式验证'),
+			_t('拦截格式不正确或临时邮箱（如包含test、temp、123等可疑邮箱）')
+		);
+		$form->addInput($strictEmailCheck->multiMode());
 
 		$ipBlacklist = new Typecho_Widget_Helper_Form_Element_Textarea(
 			'ipBlacklist',
@@ -143,6 +220,15 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			_t('当昵称中不包含中文字符时执行该操作。')
 		);
 		$form->addInput($authorChineseAction->multiMode());
+
+		$blockForeignLanguage = new Typecho_Widget_Helper_Form_Element_Checkbox(
+			'blockForeignLanguage',
+			['enable' => _t('拦截纯外语评论（俄文、韩文、日文等）')],
+			['enable'],
+			_t('外语拦截'),
+			_t('自动检测并拦截纯俄文、韩文、日文等外语评论（不影响包含中文或英文的评论）')
+		);
+		$form->addInput($blockForeignLanguage->multiMode());
 
 		// ==================== 百度内容审核 ====================
 		$baiduInfo = new Typecho_Widget_Helper_Layout('div', ['class' => 'typecho-option']);
@@ -222,6 +308,16 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 		);
 		$form->addInput($skipAdmin->multiMode());
 
+		// 拦截日志
+		$blockLog = new Typecho_Widget_Helper_Form_Element_Checkbox(
+			'blockLog',
+			['enable' => _t('记录被拦截的评论（保存到日志文件）')],
+			['enable'],
+			_t('拦截日志'),
+			_t('记录被拦截评论的时间、昵称、邮箱、内容、IP地址和拦截原因')
+		);
+		$form->addInput($blockLog->multiMode());
+
 		// 调试选项（默认关闭）
 		$debugLog = new Typecho_Widget_Helper_Form_Element_Checkbox(
 			'debugLog',
@@ -230,6 +326,28 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			_t('调试')
 		);
 		$form->addInput($debugLog->multiMode());
+
+		// 日志查看入口和测试
+		$logInfo = new Typecho_Widget_Helper_Layout('div', ['class' => 'typecho-option']);
+		$logViewUrl = Helper::options()->adminUrl . 'extending.php?panel=TSpamReview/logs.php';
+		$logDir = __DIR__ . DIRECTORY_SEPARATOR . 'logs';
+		$logDirWritable = is_dir($logDir) && is_writable($logDir);
+		$logStatusIcon = $logDirWritable ? '✅' : '❌';
+		$logStatusText = $logDirWritable ? '可写' : '不可写';
+		$logStatusColor = $logDirWritable ? '#27ae60' : '#e74c3c';
+		
+		$logInfo->html('
+			<p style="color:#467B96;">
+				📝 <a href="' . $logViewUrl . '" target="_blank">查看拦截日志</a> | 
+				日志目录：<code>usr/plugins/TSpamReview/logs/</code>
+				<span style="color:' . $logStatusColor . ';margin-left:10px;">' . $logStatusIcon . ' ' . $logStatusText . '</span>
+			</p>
+			<p style="color:#999;font-size:12px;margin-top:5px;">
+				💡 提示：启用"拦截日志"后，所有被拦截的评论都会记录到日志文件中。
+				如果日志未记录，请检查 <code>logs/</code> 目录的写入权限。
+			</p>
+		');
+		$form->addItem($logInfo);
 	}
 
 	public static function personalConfig(Typecho_Widget_Helper_Form $form) {}
@@ -416,21 +534,27 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			if (!$enabled) {
 				return;
 			}
-			$rawList = isset($opts->sensitiveWords) ? (string)$opts->sensitiveWords : '';
-			$words = array_values(self::parseSensitiveList($rawList));
-			$contentAction = isset($opts->contentChineseAction) ? (string)$opts->contentChineseAction : 'A';
-			$authorAction = isset($opts->authorChineseAction) ? (string)$opts->authorChineseAction : 'A';
+		$rawList = isset($opts->sensitiveWords) ? (string)$opts->sensitiveWords : '';
+		$words = array_values(self::parseSensitiveList($rawList));
+		$contentAction = isset($opts->contentChineseAction) ? (string)$opts->contentChineseAction : 'A';
+		$authorAction = isset($opts->authorChineseAction) ? (string)$opts->authorChineseAction : 'A';
+		
+		// 检查管理员豁免配置
+		$skipAdmin = isset($opts->skipAdminReview) && is_array($opts->skipAdminReview) && in_array('enable', $opts->skipAdminReview, true);
+		$isAdmin = self::isAdmin();
 
-			// 直接输出配置与静态脚本，避免包含文件可能引入的 BOM 输出
-			$site = Helper::options()->siteUrl;
-			$asset = rtrim($site, '/') . '/usr/plugins/TSpamReview/static/front.js.php';
-			$preAuditUrl = rtrim($site, '/') . '/usr/plugins/TSpamReview/endpoint.php';
-			$config = json_encode([
-				'words' => $words,
-				'contentAction' => $contentAction,
-				'authorAction' => $authorAction,
-				'preAuditUrl' => $preAuditUrl,
-			], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+		// 直接输出配置与静态脚本，避免包含文件可能引入的 BOM 输出
+		$site = Helper::options()->siteUrl;
+		$asset = rtrim($site, '/') . '/usr/plugins/TSpamReview/static/front.js.php';
+		$preAuditUrl = rtrim($site, '/') . '/usr/plugins/TSpamReview/endpoint.php';
+		$config = json_encode([
+			'words' => $words,
+			'contentAction' => $contentAction,
+			'authorAction' => $authorAction,
+			'preAuditUrl' => $preAuditUrl,
+			'skipAdmin' => $skipAdmin,
+			'isAdmin' => $isAdmin,
+		], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 			echo '<script>window.TSpamReviewConfig=' . $config . '</script>';
 			echo '<script src="' . htmlspecialchars($asset, ENT_QUOTES, 'UTF-8') . '"></script>';
 		} catch (Exception $e) {
@@ -458,6 +582,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				$commentIp = isset($comment['ip']) ? (string)$comment['ip'] : '';
 				if ($commentIp !== '' && in_array($commentIp, $ipBlacklist, true)) {
 					self::debug('[deny] IP in blacklist: ' . $commentIp);
+					self::logBlockedComment($comment, 'IP黑名单');
 					throw new Typecho_Widget_Exception(_t('评论失败'));
 				}
 			}
@@ -468,6 +593,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				$commentEmail = isset($comment['mail']) ? (string)$comment['mail'] : '';
 				if ($commentEmail !== '' && in_array($commentEmail, $emailBlacklist, true)) {
 					self::debug('[deny] Email in blacklist: ' . $commentEmail);
+					self::logBlockedComment($comment, '邮箱黑名单');
 					throw new Typecho_Widget_Exception(_t('评论失败'));
 				}
 			}
@@ -481,8 +607,81 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 					isset($comment['mail']) ? (string)$comment['mail'] : '',
 				], $sensitiveList)) {
 					self::debug('[deny] sensitive word matched');
+					self::logBlockedComment($comment, '敏感词汇');
 					throw new Typecho_Widget_Exception(_t('评论失败'));
 				}
+			}
+
+			// 3.1) 广告/垃圾内容检测
+			$commentText = isset($comment['text']) ? (string)$comment['text'] : '';
+			$commentAuthor = isset($comment['author']) ? (string)$comment['author'] : '';
+			$commentMail = isset($comment['mail']) ? (string)$comment['mail'] : '';
+
+		// 统一的广告检测
+		$blockSpam = isset($opts->blockSpam) && is_array($opts->blockSpam) && in_array('enable', $opts->blockSpam, true);
+		if ($blockSpam) {
+			$isSpam = false;
+			$spamType = '';
+			
+			// 调试：记录检测内容
+			self::debug('[spam check] text: ' . mb_substr($commentText, 0, 50) . ', author: ' . $commentAuthor);
+			
+			// 检测电话号码
+			if (self::hasPhoneNumber($commentText . ' ' . $commentAuthor)) {
+				$isSpam = true;
+				$spamType = 'phone';
+				self::debug('[spam] phone detected');
+			}
+			// 检测微信号
+			elseif (self::hasWechatId($commentText . ' ' . $commentAuthor)) {
+				$isSpam = true;
+				$spamType = 'wechat';
+				self::debug('[spam] wechat detected');
+			}
+			// 检测URL
+			elseif (self::hasUrl($commentText)) {
+				$isSpam = true;
+				$spamType = 'url';
+				self::debug('[spam] url detected in: ' . $commentText);
+			}
+			// 检测重复内容
+			elseif (self::hasRepetitiveContent($commentText)) {
+				$isSpam = true;
+				$spamType = 'repeat';
+				self::debug('[spam] repetitive detected');
+			}
+			
+			if ($isSpam) {
+				self::debug('[deny] spam detected: ' . $spamType);
+				self::logBlockedComment($comment, '广告信息(' . $spamType . ')');
+				throw new Typecho_Widget_Exception(_t('评论失败，疑似包含广告信息'));
+			} else {
+				self::debug('[spam check] passed');
+			}
+		}
+
+			// 昵称长度检测
+			$authorMaxLength = isset($opts->authorMaxLength) ? intval($opts->authorMaxLength) : 30;
+			if ($authorMaxLength > 0 && mb_strlen($commentAuthor, 'UTF-8') > $authorMaxLength) {
+				self::debug('[deny] author name too long: ' . mb_strlen($commentAuthor, 'UTF-8'));
+				self::logBlockedComment($comment, '昵称过长');
+				throw new Typecho_Widget_Exception(_t('评论失败'));
+			}
+
+		// 乱码检测（昵称、邮箱、评论内容）
+		$blockGarbledAuthor = isset($opts->blockGarbledAuthor) && is_array($opts->blockGarbledAuthor) && in_array('enable', $opts->blockGarbledAuthor, true);
+		if ($blockGarbledAuthor && self::hasGarbledContent($commentAuthor, $commentMail, $commentText)) {
+			self::debug('[deny] garbled content detected');
+			self::logBlockedComment($comment, '乱码内容');
+			throw new Typecho_Widget_Exception(_t('评论失败'));
+		}
+
+			// 邮箱格式检测
+			$strictEmailCheck = isset($opts->strictEmailCheck) && is_array($opts->strictEmailCheck) && in_array('enable', $opts->strictEmailCheck, true);
+			if ($strictEmailCheck && self::isInvalidEmail($commentMail)) {
+				self::debug('[deny] invalid email format');
+				self::logBlockedComment($comment, '邮箱格式错误');
+				throw new Typecho_Widget_Exception(_t('评论失败'));
 			}
 
 			// 4) 中文检测：评论内容
@@ -490,6 +689,7 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			if (!self::stringHasChinese(isset($comment['text']) ? (string)$comment['text'] : '')) {
 				if ($contentAction === 'C') {
 					self::debug('[deny] content no Chinese');
+					self::logBlockedComment($comment, '内容无中文');
 					throw new Typecho_Widget_Exception(_t('评论失败'));
 				} elseif ($contentAction === 'B') {
 					self::debug('[hold] content no Chinese → set status to waiting');
@@ -502,11 +702,20 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			if (!self::stringHasChinese(isset($comment['author']) ? (string)$comment['author'] : '')) {
 				if ($authorAction === 'C') {
 					self::debug('[deny] author no Chinese');
+					self::logBlockedComment($comment, '昵称无中文');
 					throw new Typecho_Widget_Exception(_t('评论失败'));
 				} elseif ($authorAction === 'B') {
 					self::debug('[hold] author no Chinese → set status to waiting');
 					$comment['status'] = 'waiting';
 				}
+			}
+
+			// 5.1) 外语检测
+			$blockForeignLanguage = isset($opts->blockForeignLanguage) && is_array($opts->blockForeignLanguage) && in_array('enable', $opts->blockForeignLanguage, true);
+			if ($blockForeignLanguage && self::isPureForeignLanguage($commentText)) {
+				self::debug('[deny] pure foreign language detected');
+				self::logBlockedComment($comment, '纯外语评论');
+				throw new Typecho_Widget_Exception(_t('评论失败'));
 			}
 
 			// 6) 可选：百度文本审核
@@ -520,11 +729,13 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 					$audit = self::baiduTextAudit(isset($comment['text']) ? (string)$comment['text'] : '', $apiKey, $secretKey);
 					if ($audit === 'block') {
 						self::debug('[deny] baidu returns block');
+						self::logBlockedComment($comment, '百度审核:违规');
 						throw new Typecho_Widget_Exception(_t('评论失败'));
 					} elseif ($audit === 'review') {
 						$reviewAction = isset($opts->baiduReviewAction) ? (string)$opts->baiduReviewAction : 'B';
 						if ($reviewAction === 'C') {
 							self::debug('[deny] baidu returns review → deny by config');
+							self::logBlockedComment($comment, '百度审核:疑似');
 							throw new Typecho_Widget_Exception(_t('评论失败'));
 						} else {
 							// B（待审核）- 修改评论状态为 waiting
@@ -558,6 +769,264 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			return false;
 		}
 		return (bool)preg_match('/[\x{4e00}-\x{9fa5}]/u', $text);
+	}
+
+	/**
+	 * 检测文本中是否包含电话号码
+	 */
+	private static function hasPhoneNumber($text)
+	{
+		if ($text === '') {
+			return false;
+		}
+		// 手机号：1开头的11位数字
+		if (preg_match('/1[3-9]\d{9}/', $text)) {
+			return true;
+		}
+		// 固话：区号+号码
+		if (preg_match('/0\d{2,3}[-\s]?\d{7,8}/', $text)) {
+			return true;
+		}
+		// 400/800电话
+		if (preg_match('/[48]00[-\s]?\d{3}[-\s]?\d{4}/', $text)) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * 检测文本中是否包含微信号
+	 */
+	private static function hasWechatId($text)
+	{
+		if ($text === '') {
+			return false;
+		}
+		$lower = mb_strtolower($text, 'UTF-8');
+		// 检测 wx/weixin/微信 + 数字/字母组合
+		if (preg_match('/(wx|weixin|微信)\s*[：:]\s*[a-z0-9_-]{5,}/ui', $lower)) {
+			return true;
+		}
+		if (preg_match('/(微信号|微信|vx|VX)\s*[：:\s]*[a-z0-9_-]{5,}/ui', $text)) {
+			return true;
+		}
+		// 单独的wx_或weixin_开头
+		if (preg_match('/\b(wx|weixin)_[a-z0-9_-]{4,}\b/i', $lower)) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * 检测文本中是否包含URL
+	 */
+	private static function hasUrl($text)
+	{
+		if ($text === '') {
+			return false;
+		}
+		// 检测 http(s)://
+		if (preg_match('/(https?:\/\/|ftp:\/\/)/i', $text)) {
+			return true;
+		}
+		// 检测 www.
+		if (preg_match('/\bwww\.[a-z0-9][a-z0-9-]*\.[a-z]{2,}/i', $text)) {
+			return true;
+		}
+		// 检测域名模式 (xxx.com, xxx.cn等)
+		if (preg_match('/\b[a-z0-9][-a-z0-9]{0,62}\.(com|cn|net|org|info|biz|cc|tv|me|io|co|top|xyz|site|online|tech|store|club|fun|icu|vip|shop|wang|ink|ltd|group|link|pro|kim|red|pet|art|design|wiki|pub|live|news|video|email|chat|zone|world|city|center|life|team|work|space|today|online|uno)\b/i', $text)) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * 检测文本是否存在大量重复内容
+	 */
+	private static function hasRepetitiveContent($text)
+	{
+		if ($text === '' || mb_strlen($text, 'UTF-8') < 15) {
+			return false;
+		}
+		
+		// 1. 检测单个字符重复（6次以上才算异常）
+		if (preg_match('/(.)\1{5,}/u', $text)) {
+			return true;
+		}
+		
+		// 2. 检测较长短语的过度重复（3-8个字符重复3次以上）
+		if (preg_match('/(.{3,8})\1{3,}/u', $text)) {
+			return true;
+		}
+		
+		// 3. 检测整句重复（10个字符以上重复2次以上）
+		if (preg_match('/(.{10,})\1{2,}/u', $text)) {
+			return true;
+		}
+		
+		return false;
+	}
+
+	/**
+	 * 检测昵称是否为乱码
+	 */
+	/**
+	 * 检测文本中是否包含乱码
+	 * 检测昵称、邮箱、网址、评论内容
+	 */
+	private static function hasGarbledContent($author, $mail, $text)
+	{
+		// 合并所有需要检测的内容
+		$checkContent = trim($author . ' ' . $mail . ' ' . $text);
+		
+		if ($checkContent === '') {
+			return false;
+		}
+		
+		// 检测昵称
+		if ($author !== '') {
+			$len = mb_strlen($author, 'UTF-8');
+			if ($len > 0) {
+				// 统计特殊字符数量
+				$matches = [];
+				$specialCount = preg_match_all('/[^\x{4e00}-\x{9fa5}a-zA-Z0-9\s\-_]/u', $author, $matches);
+				// 如果特殊字符占比超过50%，认为是乱码
+				if ($specialCount > $len * 0.5) {
+					return true;
+				}
+				// 检测是否包含真正的ASCII控制字符（只检测0x00-0x1F，不检测0x7F-0x9F以避免误判UTF-8）
+				if (preg_match('/[\x00-\x08\x0B-\x0C\x0E-\x1F]+/', $author)) {
+					return true;
+				}
+				// 检测是否全是特殊符号
+				if (preg_match('/^[^\x{4e00}-\x{9fa5}a-zA-Z0-9]+$/u', $author) && $len > 3) {
+					return true;
+				}
+			}
+		}
+		
+		// 检测邮箱本地部分（@之前的部分）
+		if ($mail !== '' && strpos($mail, '@') !== false) {
+			$localPart = substr($mail, 0, strpos($mail, '@'));
+			$len = mb_strlen($localPart, 'UTF-8');
+			if ($len > 0) {
+				// 邮箱本地部分包含大量特殊符号（正常邮箱允许 . - _ +）
+				$matches = [];
+				$specialCount = preg_match_all('/[^a-zA-Z0-9.\-_+]/', $localPart, $matches);
+				if ($specialCount > $len * 0.6) {
+					return true;
+				}
+				// 检测真正的ASCII控制字符（不检测0x7F-0x9F避免误判）
+				if (preg_match('/[\x00-\x08\x0B-\x0C\x0E-\x1F]/', $localPart)) {
+					return true;
+				}
+			}
+		}
+		
+	// 检测评论内容 - 放宽检测标准，只检测真正的乱码
+	if ($text !== '') {
+		// 检测是否包含过多真正的ASCII控制字符，避免误判UTF-8
+		$matches = [];
+		$controlCharCount = preg_match_all('/[\x00-\x08\x0B-\x0C\x0E-\x1F]/', $text, $matches);
+		$textLen = mb_strlen($text, 'UTF-8');
+		// 提高阈值到50%，避免误判
+		if ($textLen > 0 && $controlCharCount > $textLen * 0.5) {
+			return true;
+		}
+		
+		// 检测是否包含大量连续的特殊符号
+		// 提高到15个字符，避免误判短评论
+		if (preg_match('/[^\x{4e00}-\x{9fa5}a-zA-Z0-9\s]{15,}/u', $text)) {
+			return true;
+		}
+	}
+		
+		return false;
+	}
+	
+	/**
+	 * 向后兼容的方法
+	 * @deprecated 使用 hasGarbledContent 代替
+	 */
+	private static function isGarbledAuthor($author)
+	{
+		return self::hasGarbledContent($author, '', '');
+	}
+
+	/**
+	 * 严格的邮箱格式检查
+	 */
+	private static function isInvalidEmail($email)
+	{
+		if ($email === '') {
+			return false;
+		}
+		// 基本格式检查
+		if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+			return true;
+		}
+		$lower = mb_strtolower($email, 'UTF-8');
+		
+		// 主流邮箱服务商白名单（这些邮箱允许纯数字用户名）
+		$trustedDomains = [
+			'qq.com', '163.com', '126.com', 'gmail.com', 'outlook.com', 'hotmail.com', 
+			'yahoo.com', 'sina.com', 'sohu.com', '139.com', 'yeah.net', 'foxmail.com'
+		];
+		$domain = substr(strrchr($email, '@'), 1);
+		$isTrusted = false;
+		foreach ($trustedDomains as $trusted) {
+			if ($domain === $trusted) {
+				$isTrusted = true;
+				break;
+			}
+		}
+		
+		// 如果是受信任的域名，直接通过
+		if ($isTrusted) {
+			return false;
+		}
+		
+		// 检测临时邮箱关键词
+		$suspiciousKeywords = ['test', 'temp', 'fake', 'spam', '123', 'aaa', 'example', 'sample', 'demo', 'xxx'];
+		foreach ($suspiciousKeywords as $keyword) {
+			if (strpos($lower, $keyword) !== false) {
+				return true;
+			}
+		}
+		// 检测是否全是数字的用户名（仅针对非受信任域名）
+		if (preg_match('/^\d+@/', $email)) {
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * 检测文本是否为纯外语（俄文、韩文、日文等）
+	 */
+	private static function isPureForeignLanguage($text)
+	{
+		if ($text === '' || mb_strlen($text, 'UTF-8') < 3) {
+			return false;
+		}
+		// 检测俄文字符（Cyrillic）
+		$cyrillicCount = preg_match_all('/[\x{0400}-\x{04FF}]/u', $text);
+		// 检测韩文字符（Hangul）
+		$hangulCount = preg_match_all('/[\x{AC00}-\x{D7AF}\x{1100}-\x{11FF}]/u', $text);
+		// 检测日文假名（Hiragana + Katakana）
+		$kanaCount = preg_match_all('/[\x{3040}-\x{309F}\x{30A0}-\x{30FF}]/u', $text);
+		// 检测阿拉伯文
+		$arabicCount = preg_match_all('/[\x{0600}-\x{06FF}]/u', $text);
+		// 检测泰文
+		$thaiCount = preg_match_all('/[\x{0E00}-\x{0E7F}]/u', $text);
+		
+		$totalForeignChars = $cyrillicCount + $hangulCount + $kanaCount + $arabicCount + $thaiCount;
+		$totalLength = mb_strlen($text, 'UTF-8');
+		
+		// 如果外语字符占比超过60%，且没有中文，认为是纯外语
+		if ($totalForeignChars > $totalLength * 0.6 && !self::stringHasChinese($text)) {
+			return true;
+		}
+		return false;
 	}
 
 	private static function parseSensitiveList($raw)
@@ -792,6 +1261,80 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 	}
 
 	/**
+	 * 记录被拦截的评论
+	 */
+	private static function logBlockedComment($comment, $reason = 'unknown')
+	{
+		try {
+			$opts = Typecho_Widget::widget('Widget_Options')->plugin('TSpamReview');
+			$enabled = isset($opts->blockLog) && is_array($opts->blockLog) && in_array('enable', $opts->blockLog, true);
+			if (!$enabled) {
+				return false;
+			}
+
+			// 确保日志目录存在
+			if (!is_dir(self::$logDir)) {
+				if (!mkdir(self::$logDir, 0755, true) && !is_dir(self::$logDir)) {
+					self::debug('[log] Failed to create log directory');
+					return false;
+				}
+			}
+
+			// 确保日志目录可写
+			if (!is_writable(self::$logDir)) {
+				self::debug('[log] Log directory is not writable: ' . self::$logDir);
+				return false;
+			}
+
+			// 日志文件按日期命名
+			$logFile = self::$logDir . DIRECTORY_SEPARATOR . 'blocked_' . date('Y-m-d') . '.log';
+
+			// 提取评论信息
+			$time = date('Y-m-d H:i:s');
+			$author = isset($comment['author']) ? (string)$comment['author'] : '未知';
+			$mail = isset($comment['mail']) ? (string)$comment['mail'] : '未知';
+			$ip = isset($comment['ip']) ? (string)$comment['ip'] : '未知';
+			$text = isset($comment['text']) ? (string)$comment['text'] : '';
+			
+			// 截断过长的内容
+			if (mb_strlen($text, 'UTF-8') > 200) {
+				$text = mb_substr($text, 0, 200, 'UTF-8') . '...';
+			}
+
+			// 转义换行符
+			$text = str_replace(["\r\n", "\r", "\n"], ' ', $text);
+			$author = str_replace(["\r\n", "\r", "\n"], ' ', $author);
+			$mail = str_replace(["\r\n", "\r", "\n"], ' ', $mail);
+
+			// 构建日志条目（JSON格式，便于解析）
+			$logEntry = json_encode([
+				'time' => $time,
+				'author' => $author,
+				'mail' => $mail,
+				'ip' => $ip,
+				'text' => $text,
+				'reason' => $reason
+			], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n";
+
+			// 写入日志（使用文件锁确保并发安全）
+			$result = file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
+			
+			if ($result === false) {
+				self::debug('[log] Failed to write to log file: ' . $logFile);
+				return false;
+			}
+			
+			self::debug('[log] Blocked comment recorded: ' . $reason . ' | author=' . $author . ' | file=' . $logFile);
+			return true;
+			
+		} catch (Exception $e) {
+			self::debug('[log] Exception while writing log: ' . $e->getMessage());
+			// 即使日志写入失败，也不应该影响拦截功能
+			return false;
+		}
+	}
+
+	/**
 	 * 检查当前用户是否为管理员
 	 */
 	private static function isAdmin()
@@ -820,17 +1363,22 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 
 	public static function onFinishComment()
 	{
+		$args = func_get_args();
+		$widget = null;
+		$comment = null;
+		$commentParam = null;
+		
+		if (count($args) === 2) {
+			$widget = $args[0];
+			$comment = $args[1];
+			$commentParam = $comment;
+		} elseif (count($args) === 1) {
+			$comment = $args[0];
+			$commentParam = $comment;
+		}
+		
 		try {
 			self::debug('[hook] onFinishComment called (fallback mode)');
-			$args = func_get_args();
-			$widget = null;
-			$comment = null;
-			if (count($args) === 2) {
-				$widget = $args[0];
-				$comment = $args[1];
-			} elseif (count($args) === 1) {
-				$comment = $args[0];
-			}
 
 			$opts = Typecho_Widget::widget('Widget_Options')->plugin('TSpamReview');
 
@@ -845,19 +1393,22 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 			}
 			self::debug('[fallback] extracted coid=' . ($coid ?: 0) . ' type=' . ($type !== '' ? $type : 'n/a') . ' status=' . ($status !== '' ? $status : 'n/a'));
 
-			if ($type !== '' && $type !== 'comment') {
-				return;
-			}
-			if ($status !== '' && in_array($status, ['waiting', 'hidden'], true)) {
-				return;
-			}
+		if ($type !== '' && $type !== 'comment') {
+			self::debug('[hook] skip: not a comment type');
+			goto end_hook;
+		}
+		if ($status !== '' && in_array($status, ['waiting', 'hidden'], true)) {
+			self::debug('[hook] skip: comment is waiting or hidden');
+			goto end_hook;
+		}
 
-			// 检查管理员豁免
-			$skipAdmin = isset($opts->skipAdminReview) && is_array($opts->skipAdminReview) && in_array('enable', $opts->skipAdminReview, true);
-			if ($skipAdmin && self::isAdmin()) {
-				self::debug('[fallback][skip] admin user, bypass all reviews');
-				return;
-			}
+		// 检查管理员豁免
+		$skipAdmin = isset($opts->skipAdminReview) && is_array($opts->skipAdminReview) && in_array('enable', $opts->skipAdminReview, true);
+		if ($skipAdmin && self::isAdmin()) {
+			self::debug('[fallback][skip] admin user, bypass all reviews');
+			// 跳过所有检测，直接返回
+			goto end_hook;
+		}
 
 			$sensitiveList = self::parseSensitiveList(isset($opts->sensitiveWords) ? $opts->sensitiveWords : '');
 			$willHold = false;
@@ -927,13 +1478,17 @@ class TSpamReview_Plugin implements Typecho_Plugin_Interface
 				} catch (Exception $e) {
 					self::debug('[fallback][db-error] ' . $e->getMessage());
 				}
-			} else {
-				self::debug('[fallback] no hold rule matched');
-			}
-		} catch (Exception $e) {
-			self::debug('[fallback][error] ' . $e->getMessage());
+		} else {
+			self::debug('[fallback] no hold rule matched');
 		}
+	} catch (Exception $e) {
+		self::debug('[fallback][error] ' . $e->getMessage());
 	}
+	
+	end_hook:
+	// 返回评论对象
+	return $commentParam;
+}
 
 	private static function getFieldValue($source, $key)
 	{
